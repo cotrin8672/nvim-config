@@ -11,8 +11,9 @@ git clone https://github.com/cotrin8672/nvim-config.git ~/.config/nvim
 ```
 
 On Windows, Neovim normally reads `%LOCALAPPDATA%\nvim`. The
-[dotfiles repository](https://github.com/cotrin8672/dotfiles) installs this
-repository there through a chezmoi `git-repo` external.
+[dotfiles repository](https://github.com/cotrin8672/dotfiles) manages this
+repository at `~/ghq/github.com/cotrin8672/nvim-config` through a chezmoi
+`git-repo` external and links the Neovim configuration directory to it.
 
 Start Neovim to let lazy.nvim install the configured plugins. Language tools
 and other external programs must be installed separately.
