@@ -3,7 +3,6 @@ return {
 	ft = {
 		"bash",
 		"lua",
-		"matlab",
 		"ruby",
 		"sh",
 		"vim",

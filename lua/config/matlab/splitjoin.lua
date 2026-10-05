@@ -11,22 +11,13 @@ vim.api.nvim_create_autocmd("BufWipeout", {
 })
 
 local list_types = {
-	arguments = { open = "", close = "", separator = "," },
+	arguments = { open = "(", close = ")", separator = "," },
 	function_arguments = { open = "(", close = ")", separator = "," },
 	multioutput_variable = { open = "[", close = "]", separator = "," },
 	attributes = { open = "(", close = ")", separator = "," },
 	dimensions = { open = "(", close = ")", separator = "," },
 	validation_functions = { open = "{", close = "}", separator = "," },
 	range = { open = "", close = "", separator = ":" },
-}
-
-local opening_delimiters = {
-	arguments = "(",
-	function_arguments = "(",
-	multioutput_variable = "[",
-	attributes = "(",
-	dimensions = "(",
-	validation_functions = "{",
 }
 
 local container_types = vim.tbl_extend("force", {}, list_types, {
@@ -111,11 +102,11 @@ local function direct_operator(node)
 end
 
 local function has_blocking_syntax(node, bufnr)
-	if node:type() == "ERROR" or node:type() == "comment" then
+	if node:missing() or node:type() == "ERROR" or node:type() == "comment" then
 		return true
 	end
 
-	if node:type() == "line_continuation" and node_text(node, bufnr):find("%", 1, true) then
+	if node:type() == "line_continuation" and not node_text(node, bufnr):match("^%.%.%.%s*$") then
 		return true
 	end
 
@@ -136,9 +127,14 @@ local function node_at_cursor(bufnr)
 	return vim.treesitter.get_node({ bufnr = bufnr, pos = { row, col } })
 end
 
+local function separate_arguments(node)
+	return node:type() == "function_arguments"
+		or (node:type() == "arguments" and node:parent():type() == "function_call")
+end
+
 local function container_has_multiple_items(node)
 	if node:type() ~= "matrix" and node:type() ~= "cell" then
-		return #direct_named_children(node) >= 2
+		return #direct_named_children(node) >= (separate_arguments(node) and 1 or 2)
 	end
 
 	local count = 0
@@ -167,21 +163,43 @@ local function wrapped_target(node)
 end
 
 local function target_range(node)
-	local start_row, start_col, end_row, end_col = node:range()
-	local continuation = node:prev_named_sibling()
-	if not continuation or continuation:type() ~= "line_continuation" then
-		return start_row, start_col, end_row, end_col
+	if node:type() == "arguments" then
+		local opening, closing
+		for child in node:parent():iter_children() do
+			if child:type() == "(" then
+				opening = child
+			elseif child:type() == ")" then
+				closing = child
+			end
+		end
+		if opening and closing then
+			local start_row, start_col = opening:range()
+			local _, _, end_row, end_col = closing:range()
+			return start_row, start_col, end_row, end_col
+		end
 	end
-
-	local opening = assert(continuation:prev_sibling(), "leading continuation has no opening delimiter")
-	assert(opening:type() == opening_delimiters[node:type()], "leading continuation has an unexpected delimiter")
-	local _, _, opening_end_row, opening_end_col = opening:range()
-	return opening_end_row, opening_end_col, end_row, end_col
+	return node:range()
 end
 
 local function target_contains_row(node, row)
 	local start_row, _, end_row, end_col = target_range(node)
 	return row >= start_row and (row < end_row or (row == end_row and end_col > 0))
+end
+
+local function target_is_split(node, bufnr, original)
+	if not separate_arguments(node) then
+		return original:find("\n", 1, true) ~= nil
+	end
+
+	local row, col, end_row, end_col = target_range(node)
+	for _, child in ipairs(direct_named_children(node)) do
+		local child_row, child_col, child_end_row, child_end_col = child:range()
+		if get_text(bufnr, row, col, child_row, child_col):find("\n", 1, true) then
+			return true
+		end
+		row, col = child_end_row, child_end_col
+	end
+	return get_text(bufnr, row, col, end_row, end_col):find("\n", 1, true) ~= nil
 end
 
 local function target_from_node(node, row)
@@ -252,11 +270,11 @@ local function continuation_indent(bufnr, start_row)
 	if width == 0 then
 		width = vim.bo[bufnr].tabstop
 	end
-	return base .. string.rep(" ", width)
+	return base .. string.rep(" ", width), base
 end
 
-local function render_parts(open, close, items, separators, indent, split)
-	if #items < 2 then
+local function render_parts(open, close, items, separators, indent, split, base)
+	if #items < (base and 1 or 2) then
 		return nil
 	end
 
@@ -275,6 +293,15 @@ local function render_parts(open, close, items, separators, indent, split)
 		return separator == " " and " ..." or separator .. " ..."
 	end
 
+	if base then
+		local lines = { open .. " ..." }
+		for index, item in ipairs(items) do
+			table.insert(lines, indent .. item .. (index < #items and split_suffix(separators[index]) or " ..."))
+		end
+		table.insert(lines, base .. close)
+		return table.concat(lines, "\n"), #indent, 1
+	end
+
 	local lines = { open .. items[1] .. split_suffix(separators[1]) }
 	for index = 2, #items do
 		local suffix = ""
@@ -290,7 +317,7 @@ end
 local function format_list(node, bufnr, split)
 	local config = list_types[node:type()]
 	local children = direct_named_children(node)
-	if #children < 2 then
+	if #children < (separate_arguments(node) and 1 or 2) then
 		return nil
 	end
 
@@ -307,8 +334,17 @@ local function format_list(node, bufnr, split)
 		end
 	end
 
-	local start_row = node:range()
-	return render_parts(config.open, config.close, items, separators, continuation_indent(bufnr, start_row), split)
+	local start_row = target_range(node)
+	local indent, base = continuation_indent(bufnr, start_row)
+	return render_parts(
+		config.open,
+		config.close,
+		items,
+		separators,
+		indent,
+		split,
+		separate_arguments(node) and base or nil
+	)
 end
 
 local function matrix_parts(node, bufnr)
@@ -532,6 +568,11 @@ local function state_at_cursor(bufnr)
 	end
 
 	if nearest then
+		vim.treesitter.get_parser(bufnr, "matlab"):parse(true)
+		local target = target_from_node(node_at_cursor(bufnr), row)
+		if target and not vim.deep_equal({ target_range(target) }, vim.list_slice(nearest, 2)) then
+			return nil
+		end
 		return unpack(nearest)
 	end
 end
@@ -567,23 +608,15 @@ function M.toggle(bufnr)
 	if not node then
 		return false
 	end
-	local leading_continuation = node:prev_named_sibling()
-	if
-		has_blocking_syntax(node, bufnr)
-		or (
-			leading_continuation
-			and leading_continuation:type() == "line_continuation"
-			and has_blocking_syntax(leading_continuation, bufnr)
-		)
-	then
+	if has_blocking_syntax(node:type() == "arguments" and node:parent() or node, bufnr) then
 		notify("The selected MATLAB expression contains a comment or syntax error")
 		return false
 	end
 
 	local start_row, start_col, end_row, end_col = target_range(node)
 	local original = get_text(bufnr, start_row, start_col, end_row, end_col)
-	local is_split = original:find("\n", 1, true) ~= nil
-	local formatted, generated_cursor_col = format_target(node, bufnr, not is_split)
+	local is_split = target_is_split(node, bufnr, original)
+	local formatted, generated_cursor_col, generated_cursor_row = format_target(node, bufnr, not is_split)
 	if not formatted or formatted == original then
 		notify(
 			is_split and "The selected MATLAB expression cannot be joined"
@@ -595,7 +628,7 @@ function M.toggle(bufnr)
 	local state = {
 		forms = {
 			{ text = original, cursor = relative_cursor(bufnr, start_row, start_col) },
-			{ text = formatted, cursor = { 0, assert(generated_cursor_col) } },
+			{ text = formatted, cursor = { generated_cursor_row or 0, assert(generated_cursor_col) } },
 		},
 		current = 1,
 	}

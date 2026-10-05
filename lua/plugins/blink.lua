@@ -26,6 +26,21 @@ return {
 		},
 		snippets = {
 			preset = "luasnip",
+			jump = function(direction)
+				local ls = require("luasnip")
+				if not require("blink.cmp").is_visible() and not ls.locally_jumpable(1) and ls.expandable() then
+					return ls.expand_or_jump()
+				end
+				if not ls.jumpable(direction) then
+					return false
+				end
+				if vim.bo.filetype == "matlab" and vim.fn.mode() == "i" then
+					-- LuaSnip changes rows by API; close the current insert undo
+					-- block first so undo restores both text and cursor history.
+					vim.cmd("let &l:undolevels = &l:undolevels")
+				end
+				return ls.jump(direction)
+			end,
 		},
 		completion = {
 			list = {
@@ -72,6 +87,26 @@ return {
 				})()
 			end,
 			providers = {
+				snippets = {
+					should_show_items = function(ctx)
+						if vim.bo[ctx.bufnr].filetype ~= "matlab" then
+							return true
+						end
+						local state = require("config.matlab.syntax").context(ctx.bufnr, ctx.pos.row)
+						local before = ctx.line:sub(1, ctx.pos.col)
+						-- The MATLAB snippets create statements/blocks, so an
+						-- argument or expression must use expression completions.
+						return not state.logical
+							and not state.in_block_comment
+							and before:match("^%s*[%a_][%w_]*$") ~= nil
+					end,
+					min_keyword_length = function(ctx)
+						return vim.bo[ctx.bufnr].filetype == "matlab" and 1 or 0
+					end,
+					score_offset = function(ctx)
+						return vim.bo[ctx.bufnr].filetype == "matlab" and 5 or -1
+					end,
+				},
 				lsp = {
 					transform_items = function(ctx, items)
 						items = require("config.rust.completion")(ctx, items)

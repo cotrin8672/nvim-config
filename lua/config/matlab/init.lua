@@ -1,23 +1,6 @@
 local M = {}
 local registered = false
 
-local matlab_block_keywords = {
-	arguments = true,
-	classdef = true,
-	enumeration = true,
-	events = true,
-	["for"] = true,
-	["function"] = true,
-	["if"] = true,
-	methods = true,
-	parfor = true,
-	properties = true,
-	spmd = true,
-	switch = true,
-	try = true,
-	["while"] = true,
-}
-
 local matlab_dedent_keywords = {
 	case = true,
 	catch = true,
@@ -27,118 +10,48 @@ local matlab_dedent_keywords = {
 	otherwise = true,
 }
 
-local function strip_matlab_comment(line)
-	local quote
-	local index = 1
-	while index <= #line do
-		local character = line:sub(index, index)
-		if quote then
-			if character == quote then
-				if line:sub(index + 1, index + 1) == quote then
-					index = index + 1
-				else
-					quote = nil
-				end
-			end
-		elseif character == "'" or character == '"' then
-			quote = character
-		elseif character == "%" then
-			return line:sub(1, index - 1)
-		end
-		index = index + 1
-	end
-	return line
-end
-
-local function matlab_keyword(line)
-	return vim.trim(strip_matlab_comment(line)):match("^(%a+)")
-end
-
-local arguments_contexts = {}
-
-local function matlab_arguments_context(bufnr, lnum)
-	local cache = arguments_contexts[bufnr]
-	if not cache then
-		cache = { valid = 0, states = { [0] = {} } }
-		arguments_contexts[bufnr] = cache
-		vim.api.nvim_buf_attach(bufnr, false, {
-			on_lines = function(_, _, _, first)
-				cache.valid = math.min(cache.valid, first)
-				for row = cache.valid + 1, #cache.states do
-					cache.states[row] = nil
-				end
-			end,
-			on_reload = function()
-				cache.valid, cache.states = 0, { [0] = {} }
-			end,
-			on_detach = function()
-				arguments_contexts[bufnr] = nil
-			end,
-		})
-	end
-	local target = lnum - 1
-	if target <= cache.valid then
-		return cache.states[target].top, cache.states[target].last_closed
-	end
-	local context = cache.states[cache.valid]
-	local top, last_closed_arguments = context.top, context.last_closed
-	local lines = vim.api.nvim_buf_get_lines(bufnr, cache.valid, target, false)
-	for index, line in ipairs(lines) do
-		local line_number = cache.valid + index
-		local code = vim.trim(strip_matlab_comment(line))
-		local keyword = code:match("^(%a+)")
-		if keyword == "end" then
-			local block = top
-			top = block and block.parent
-			if block and block.kind == "arguments" then
-				last_closed_arguments = {
-					line = line_number,
-				}
-			end
-		elseif code ~= "" then
-			last_closed_arguments = nil
-			if matlab_block_keywords[keyword] then
-				top = {
-					kind = keyword,
-					line = line_number,
-					parent = top,
-				}
-			end
-		end
-		cache.states[line_number] = { top = top, last_closed = last_closed_arguments }
-	end
-	cache.valid = target
-	return top, last_closed_arguments
-end
-
 function M.indent(lnum)
 	local bufnr = vim.api.nvim_get_current_buf()
-	local base_indent = 0
-	if vim.fn.exists("*GetMatlabIndent") == 1 then
-		local ok, result = pcall(vim.fn.GetMatlabIndent)
-		if ok then
-			base_indent = result
-		end
-	end
-
-	local top, last_closed_arguments = matlab_arguments_context(bufnr, lnum)
+	local syntax = require("config.matlab.syntax")
+	local context = syntax.context(bufnr, lnum - 1)
+	local top, last_closed_arguments = context.top, context.last_closed
 	local current_line = vim.api.nvim_buf_get_lines(bufnr, lnum - 1, lnum, false)[1] or ""
-	local current_keyword = matlab_keyword(current_line)
-	if current_keyword == "end" and top then
-		return vim.fn.indent(top.line)
+	local current_code = syntax.line(current_line, context.in_block_comment).code
+	local current_keyword = syntax.keyword(current_code)
+	local width = vim.fn.shiftwidth()
+	if context.in_block_comment then
+		return vim.fn.indent(lnum - 1)
 	end
-	if top and top.kind == "arguments" then
-		return vim.fn.indent(top.line) + vim.fn.shiftwidth()
+	if context.logical then
+		local opener = context.logical.delimiter
+		local indent = vim.fn.indent(opener and opener.line or context.logical.line)
+		local close = current_code:match("^%s*([%)%]}])")
+		local pairs = { [")"] = "(", ["]"] = "[", ["}"] = "{" }
+		if close and opener and pairs[close] == opener.character then
+			return indent
+		end
+		return indent + width
 	end
-	if
-		last_closed_arguments
-		and last_closed_arguments.line == lnum - 1
-		and not matlab_dedent_keywords[current_keyword]
-	then
+	if current_keyword == "function" then
+		local header = syntax.context(bufnr, lnum).header
+		local parent = header and header.parent or syntax.function_parent(bufnr, lnum, top)
+		return parent and (vim.fn.indent(parent.line) + width) or 0
+	end
+	if top and matlab_dedent_keywords[current_keyword] then
+		local extra = (current_keyword == "case" or current_keyword == "otherwise") and width or 0
+		return vim.fn.indent(top.line) + extra
+	end
+	if top then
+		local extra = top.kind == "switch" and context.branch and context.branch.block == top and width or 0
+		return vim.fn.indent(top.line) + width + extra
+	end
+	if current_keyword == "end" then
+		return 0
+	end
+	if last_closed_arguments and last_closed_arguments.line == lnum - 1 then
 		return vim.fn.indent(last_closed_arguments.line)
 	end
-
-	return base_indent
+	return 0
 end
 
 local function setup_matlab_indent()
